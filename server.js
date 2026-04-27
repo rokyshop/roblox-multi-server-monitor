@@ -25,7 +25,7 @@ function getOrCreateServer(serverId) {
     return servers.get(serverId);
 }
 
-// ─── POST /report (heartbeat) ───────────────────────────────────
+// ─── POST /report ───────────────────────────────────────────────
 app.post('/report', (req, res) => {
     const { serverId, cameraId, cframe, fov, frames, joins, leaves } = req.body;
     if (!serverId) return res.status(400).json({ error: 'serverId obligatoire' });
@@ -33,24 +33,19 @@ app.post('/report', (req, res) => {
     const srv = getOrCreateServer(serverId);
     srv.lastSeen = Date.now();
 
-    // 🔥 On ne stocke les frames QUE si le serveur les envoie (mode streaming)
-    if (cameraId && frames && frames.length > 0) {
+    if (cameraId && frames?.length > 0) {
         const existing = srv.cameras.get(cameraId);
-        const prevFrames = existing?.frames ?? [];
-        const merged = [...prevFrames, ...frames];
+        const merged = [...(existing?.frames ?? []), ...frames];
         srv.cameras.set(cameraId, {
-            cframe,
-            fov,
+            cframe, fov,
             frames: merged.length > MAX_FRAMES ? merged.slice(-MAX_FRAMES) : merged,
             timestamp: Date.now(),
         });
     }
 
-    // Mise à jour des infos même sans frames (cameraId seul)
     if (cameraId && !frames) {
         srv.cameras.set(cameraId, {
-            cframe,
-            fov,
+            cframe, fov,
             frames: srv.cameras.get(cameraId)?.frames ?? [],
             timestamp: Date.now(),
         });
@@ -59,7 +54,8 @@ app.post('/report', (req, res) => {
     joins?.forEach(p  => srv.players.set(p.userId, p));
     leaves?.forEach(id => srv.players.delete(id));
 
-    // 🔥 RÉPONSE : dire au serveur s'il doit streamer
+    // ✅ active contrôlé par MessagingService désormais
+    // On garde le fallback pour Studio (MessagingService indisponible)
     const shouldBeActive = (activeViewer === serverId);
     res.json({ ok: true, active: shouldBeActive });
 });
