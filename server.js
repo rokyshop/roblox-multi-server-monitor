@@ -2,7 +2,7 @@ const express = require('express');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const MAX_FRAMES = 300;   // ~15s à 20fps
+const MAX_FRAMES = 200;   // ~15s à 20fps
 const SERVER_TTL = 60_000;
 
 app.use(express.json({ limit: '2mb' }));
