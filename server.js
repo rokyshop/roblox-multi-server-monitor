@@ -2,15 +2,16 @@ const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Cap sur le nombre de frames stockées par caméra (évite OOM)
 const MAX_FRAMES = 50;
-// Durée d'inactivité avant suppression d'un serveur (ms)
 const SERVER_TTL = 60_000;
 
 app.use(express.json({ limit: '1mb' }));
 
-// serverId → { lastSeen: number, cameras: Map, players: Map }
+// serverId → { lastSeen, cameras: Map, players: Map }
 const servers = new Map();
+
+// 🔥 NOUVEAU : quel serveur est actuellement regardé
+let activeViewer = null;
 
 // ─── Helpers ────────────────────────────────────────────────────
 function getOrCreateServer(serverId) {
@@ -24,7 +25,7 @@ function getOrCreateServer(serverId) {
     return servers.get(serverId);
 }
 
-// ─── POST /report ────────────────────────────────────────────────
+// ─── POST /report (heartbeat) ───────────────────────────────────
 app.post('/report', (req, res) => {
     const { serverId, cameraId, cframe, fov, frames, joins, leaves } = req.body;
     if (!serverId) return res.status(400).json({ error: 'serverId obligatoire' });
@@ -32,12 +33,11 @@ app.post('/report', (req, res) => {
     const srv = getOrCreateServer(serverId);
     srv.lastSeen = Date.now();
 
-    if (cameraId) {
-        // On fusionne les nouvelles frames avec un cap pour éviter la fuite mémoire
+    // 🔥 On ne stocke les frames QUE si le serveur les envoie (mode streaming)
+    if (cameraId && frames && frames.length > 0) {
         const existing = srv.cameras.get(cameraId);
         const prevFrames = existing?.frames ?? [];
-        const merged = [...prevFrames, ...(frames ?? [])];
-
+        const merged = [...prevFrames, ...frames];
         srv.cameras.set(cameraId, {
             cframe,
             fov,
@@ -46,25 +46,55 @@ app.post('/report', (req, res) => {
         });
     }
 
+    // Mise à jour des infos même sans frames (cameraId seul)
+    if (cameraId && !frames) {
+        srv.cameras.set(cameraId, {
+            cframe,
+            fov,
+            frames: srv.cameras.get(cameraId)?.frames ?? [],
+            timestamp: Date.now(),
+        });
+    }
+
     joins?.forEach(p  => srv.players.set(p.userId, p));
     leaves?.forEach(id => srv.players.delete(id));
 
-    res.json({ ok: true });
+    // 🔥 RÉPONSE : dire au serveur s'il doit streamer
+    const shouldBeActive = (activeViewer === serverId);
+    res.json({ ok: true, active: shouldBeActive });
+});
+
+// ─── POST /watch (clic sur un serveur) ──────────────────────────
+app.post('/watch', (req, res) => {
+    const { serverId } = req.body;
+    if (!serverId) return res.status(400).json({ error: 'serverId obligatoire' });
+
+    const oldServer = activeViewer;
+    activeViewer = serverId;
+
+    console.log(`[Watch] ${oldServer || 'aucun'} → ${serverId}`);
+    res.json({ ok: true, watching: serverId, stopped: oldServer });
+});
+
+// ─── POST /unwatch (optionnel, fermeture viewer) ─────────────────
+app.post('/unwatch', (_req, res) => {
+    const old = activeViewer;
+    activeViewer = null;
+    console.log(`[Watch] Arrêt de ${old}`);
+    res.json({ ok: true, stopped: old });
 });
 
 // ─── GET /servers ────────────────────────────────────────────────
 app.get('/servers', (_req, res) => {
     const now = Date.now();
     const active = [];
-
     for (const [id, data] of servers) {
         if (now - data.lastSeen < SERVER_TTL) {
             active.push(id);
         } else {
-            servers.delete(id); // nettoyage inline
+            servers.delete(id);
         }
     }
-
     res.json(active);
 });
 
@@ -77,7 +107,6 @@ app.get('/camera', (req, res) => {
     const cam = srv.cameras.get(cameraId);
     if (!cam) return res.status(404).json({ error: 'caméra inconnue' });
 
-    // On vide les frames après envoi pour éviter de renvoyer les mêmes données
     const payload = {
         ...cam,
         skinCache: Array.from(srv.players.values()),
@@ -87,12 +116,18 @@ app.get('/camera', (req, res) => {
     res.json(payload);
 });
 
-// ─── Cleanup périodique (filet de sécurité) ──────────────────────
+// ─── Cleanup périodique ──────────────────────────────────────────
 setInterval(() => {
     const now = Date.now();
     for (const [id, data] of servers) {
-        if (now - data.lastSeen >= SERVER_TTL) servers.delete(id);
+        if (now - data.lastSeen >= SERVER_TTL) {
+            servers.delete(id);
+            // Si le serveur qui expire était le viewer actif, on libère
+            if (activeViewer === id) {
+                activeViewer = null;
+            }
+        }
     }
 }, 30_000);
 
-app.listen(PORT, () => console.log(`[Monitor] Backend actif sur :${PORT}`));
+app.listen(PORT, () => console.log(`[Monitor] Backend on-demand actif sur :${PORT}`));
