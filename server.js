@@ -76,8 +76,8 @@ app.post('/watch', (req, res) => {
     res.json({ ok: true, watching: serverId, stopped: oldServer });
 });
 
-// ─── POST /unwatch (optionnel, fermeture viewer) ─────────────────
-app.post('/unwatch', (_req, res) => {
+// ─── POST /unwatch ─────────────────────────────────────────────
+app.post('/unwatch', (req, res) => {  // ✅ Plus de underscore, body peut être vide
     const old = activeViewer;
     activeViewer = null;
     console.log(`[Watch] Arrêt de ${old}`);
