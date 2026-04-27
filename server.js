@@ -1,72 +1,98 @@
 const express = require('express');
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+// Cap sur le nombre de frames stockées par caméra (évite OOM)
+const MAX_FRAMES = 50;
+// Durée d'inactivité avant suppression d'un serveur (ms)
+const SERVER_TTL = 60_000;
 
-const servers = new Map(); // serverId → { lastSeen: Date, cameras: Map, players: Map }
+app.use(express.json({ limit: '1mb' }));
 
+// serverId → { lastSeen: number, cameras: Map, players: Map }
+const servers = new Map();
+
+// ─── Helpers ────────────────────────────────────────────────────
+function getOrCreateServer(serverId) {
+    if (!servers.has(serverId)) {
+        servers.set(serverId, {
+            lastSeen: Date.now(),
+            cameras: new Map(),
+            players: new Map(),
+        });
+    }
+    return servers.get(serverId);
+}
+
+// ─── POST /report ────────────────────────────────────────────────
 app.post('/report', (req, res) => {
     const { serverId, cameraId, cframe, fov, frames, joins, leaves } = req.body;
+    if (!serverId) return res.status(400).json({ error: 'serverId obligatoire' });
 
-    if (!serverId) return res.status(400).json({ error: "serverId obligatoire" });
+    const srv = getOrCreateServer(serverId);
+    srv.lastSeen = Date.now();
 
-    if (!servers.has(serverId)) {
-        servers.set(serverId, { lastSeen: new Date(), cameras: new Map(), players: new Map() });
-    }
-
-    const serverData = servers.get(serverId);
-    serverData.lastSeen = new Date();
-
-    // Mise à jour de la caméra
     if (cameraId) {
-        serverData.cameras.set(cameraId, {
+        // On fusionne les nouvelles frames avec un cap pour éviter la fuite mémoire
+        const existing = srv.cameras.get(cameraId);
+        const prevFrames = existing?.frames ?? [];
+        const merged = [...prevFrames, ...(frames ?? [])];
+
+        srv.cameras.set(cameraId, {
             cframe,
             fov,
-            frames: frames || [],
-            timestamp: Date.now()
+            frames: merged.length > MAX_FRAMES ? merged.slice(-MAX_FRAMES) : merged,
+            timestamp: Date.now(),
         });
     }
 
-    // Gestion des entrées (Skins)
-    if (joins) {
-        joins.forEach(p => serverData.players.set(p.userId, p));
-    }
+    joins?.forEach(p  => srv.players.set(p.userId, p));
+    leaves?.forEach(id => srv.players.delete(id));
 
-    // Gestion des sorties
-    if (leaves) {
-        leaves.forEach(userId => serverData.players.delete(userId));
-    }
-
-    res.json({ status: "ok" });
+    res.json({ ok: true });
 });
 
-app.get('/servers', (req, res) => {
-    const active = [];
+// ─── GET /servers ────────────────────────────────────────────────
+app.get('/servers', (_req, res) => {
     const now = Date.now();
+    const active = [];
+
     for (const [id, data] of servers) {
-        if (now - data.lastSeen.getTime() < 60000) {
+        if (now - data.lastSeen < SERVER_TTL) {
             active.push(id);
         } else {
-            servers.delete(id);
+            servers.delete(id); // nettoyage inline
         }
     }
+
     res.json(active);
 });
 
+// ─── GET /camera ─────────────────────────────────────────────────
 app.get('/camera', (req, res) => {
     const { serverId, cameraId } = req.query;
-    const server = servers.get(serverId);
-    if (!server) return res.json({ error: "serveur inconnu" });
+    const srv = servers.get(serverId);
+    if (!srv) return res.status(404).json({ error: 'serveur inconnu' });
 
-    const cam = server.cameras.get(cameraId);
-    if (!cam) return res.json({ error: "caméra inconnue" });
+    const cam = srv.cameras.get(cameraId);
+    if (!cam) return res.status(404).json({ error: 'caméra inconnue' });
 
-    // On renvoie la caméra + la liste des skins connus du serveur
-    res.json({
+    // On vide les frames après envoi pour éviter de renvoyer les mêmes données
+    const payload = {
         ...cam,
-        skinCache: Array.from(server.players.values())
-    });
+        skinCache: Array.from(srv.players.values()),
+    };
+    cam.frames = []; // flush
+
+    res.json(payload);
 });
 
-app.listen(port, () => console.log(`Backend sur port ${port}`));
+// ─── Cleanup périodique (filet de sécurité) ──────────────────────
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, data] of servers) {
+        if (now - data.lastSeen >= SERVER_TTL) servers.delete(id);
+    }
+}, 30_000);
+
+app.listen(PORT, () => console.log(`[Monitor] Backend actif sur :${PORT}`));
